@@ -1,0 +1,94 @@
+// Command api runs the payments ledger HTTP service and the webhook worker.
+package main
+
+import (
+	"context"
+	"errors"
+	"log/slog"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"github.com/marcosnobre26/go-payments-ledger/internal/database"
+	"github.com/marcosnobre26/go-payments-ledger/internal/httpapi"
+	"github.com/marcosnobre26/go-payments-ledger/internal/ledger"
+	"github.com/marcosnobre26/go-payments-ledger/internal/webhook"
+)
+
+func main() {
+	log := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	if err := run(log); err != nil {
+		log.Error("fatal", "error", err)
+		os.Exit(1)
+	}
+}
+
+func run(log *slog.Logger) error {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	dsn := env("DATABASE_URL", "postgres://ledger:ledger@localhost:5432/ledger?sslmode=disable")
+	secret := os.Getenv("WEBHOOK_SECRET")
+	if secret == "" {
+		return errors.New("WEBHOOK_SECRET is required")
+	}
+	provider := env("WEBHOOK_PROVIDER", "acmepay")
+
+	db, err := database.Open(ctx, dsn)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	if err := database.Migrate(ctx, db); err != nil {
+		return err
+	}
+
+	ledgerSvc := ledger.NewService(db)
+	api := httpapi.New(ledgerSvc, webhook.NewStore(db), map[string][]byte{provider: []byte(secret)}, log)
+
+	srv := &http.Server{
+		Addr:              ":" + env("PORT", "8080"),
+		Handler:           api.Handler(),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      15 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
+
+	workerDone := make(chan struct{})
+	go func() {
+		defer close(workerDone)
+		webhook.NewWorker(db, ledgerSvc, log).Run(ctx)
+	}()
+
+	serverErr := make(chan error, 1)
+	go func() {
+		log.Info("listening", "addr", srv.Addr)
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			serverErr <- err
+		}
+	}()
+
+	select {
+	case err := <-serverErr:
+		return err
+	case <-ctx.Done():
+	}
+
+	// Graceful shutdown: stop accepting requests, let in-flight ones finish.
+	log.Info("shutting down")
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	err = srv.Shutdown(shutdownCtx)
+	<-workerDone
+	return err
+}
+
+func env(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
+}
