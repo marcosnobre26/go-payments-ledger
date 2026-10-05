@@ -1,7 +1,3 @@
-// Package ledger implements a double-entry ledger with idempotent transfers.
-//
-// Money is always represented as int64 minor units (cents) to avoid the
-// rounding errors of floating point arithmetic.
 package ledger
 
 import (
@@ -16,8 +12,6 @@ import (
 	"time"
 )
 
-// Domain errors. The HTTP layer maps them to status codes and the webhook
-// worker treats them as permanent (non-retryable) failures.
 var (
 	ErrAccountNotFound      = errors.New("account not found")
 	ErrInsufficientFunds    = errors.New("insufficient funds")
@@ -34,8 +28,6 @@ var (
 	uuidRe     = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
 )
 
-// IsPermanent reports whether err is a business-rule failure that will not
-// succeed on retry.
 func IsPermanent(err error) bool {
 	for _, target := range []error{
 		ErrAccountNotFound, ErrInsufficientFunds, ErrCurrencyMismatch,
@@ -95,8 +87,6 @@ func (in TransferInput) validate() error {
 	return nil
 }
 
-// hash fingerprints the request so a reused idempotency key with a different
-// payload can be rejected instead of silently returning the old result.
 func (in TransferInput) hash() string {
 	sum := sha256.Sum256([]byte(fmt.Sprintf("%s|%s|%d|%s", in.FromAccountID, in.ToAccountID, in.Amount, in.Currency)))
 	return hex.EncodeToString(sum[:])
@@ -136,7 +126,6 @@ func (s *Service) GetAccount(ctx context.Context, id string) (Account, error) {
 	return a, err
 }
 
-// ListEntries returns the most recent ledger entries of an account (statement).
 func (s *Service) ListEntries(ctx context.Context, accountID string, limit int) ([]Entry, error) {
 	if _, err := s.GetAccount(ctx, accountID); err != nil {
 		return nil, err
@@ -164,11 +153,6 @@ func (s *Service) ListEntries(ctx context.Context, accountID string, limit int) 
 	return entries, rows.Err()
 }
 
-// Transfer moves money between two accounts exactly once per idempotency key.
-// The key record and the ledger postings are committed in the same database
-// transaction, so a retried request can never be applied twice. It returns
-// replayed=true when the key was already used and the original transfer is
-// returned instead of creating a new one.
 func (s *Service) Transfer(ctx context.Context, idempotencyKey string, in TransferInput) (t Transfer, replayed bool, err error) {
 	if err := in.validate(); err != nil {
 		return Transfer{}, false, err
@@ -178,10 +162,8 @@ func (s *Service) Transfer(ctx context.Context, idempotencyKey string, in Transf
 	if err != nil {
 		return Transfer{}, false, err
 	}
-	defer tx.Rollback() //nolint:errcheck // no-op after Commit
+	defer tx.Rollback()
 
-	// If another request holds the same key, this INSERT waits for it to
-	// finish, then either conflicts (it committed) or succeeds (it rolled back).
 	res, err := tx.ExecContext(ctx,
 		`INSERT INTO idempotency_keys (key, request_hash) VALUES ($1, $2) ON CONFLICT (key) DO NOTHING`,
 		idempotencyKey, in.hash())
@@ -222,22 +204,18 @@ func (s *Service) Transfer(ctx context.Context, idempotencyKey string, in Transf
 	}, false, nil
 }
 
-// Deposit credits an account from the currency's settlement account in its own
-// database transaction. Used by tests and simple callers.
 func (s *Service) Deposit(ctx context.Context, accountID string, amount int64, currency, reference string) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback() //nolint:errcheck
+	defer tx.Rollback()
 	if err := s.DepositTx(ctx, tx, accountID, amount, currency, reference); err != nil {
 		return err
 	}
 	return tx.Commit()
 }
 
-// DepositTx credits an account inside a caller-owned transaction, so the
-// webhook worker can mark the event as processed atomically with the deposit.
 func (s *Service) DepositTx(ctx context.Context, tx *sql.Tx, accountID string, amount int64, currency, reference string) error {
 	if !currencyRe.MatchString(currency) {
 		return ErrInvalidCurrency
@@ -265,11 +243,7 @@ func (s *Service) DepositTx(ctx context.Context, tx *sql.Tx, accountID string, a
 	return err
 }
 
-// post writes one balanced double-entry transaction: a debit on `from` and a
-// credit on `to`, and updates both cached balances.
 func post(ctx context.Context, tx *sql.Tx, kind string, reference *string, from, to string, amount int64, currency string) (string, time.Time, error) {
-	// Lock both accounts in a deterministic order. Two concurrent transfers
-	// A->B and B->A would otherwise lock in opposite order and deadlock.
 	ids := []string{from, to}
 	sort.Strings(ids)
 

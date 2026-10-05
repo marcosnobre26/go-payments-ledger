@@ -1,4 +1,3 @@
-// Command api runs the payments ledger HTTP service and the webhook worker.
 package main
 
 import (
@@ -14,6 +13,7 @@ import (
 	"github.com/marcosnobre26/go-payments-ledger/internal/database"
 	"github.com/marcosnobre26/go-payments-ledger/internal/httpapi"
 	"github.com/marcosnobre26/go-payments-ledger/internal/ledger"
+	"github.com/marcosnobre26/go-payments-ledger/internal/metrics"
 	"github.com/marcosnobre26/go-payments-ledger/internal/webhook"
 )
 
@@ -46,7 +46,15 @@ func run(log *slog.Logger) error {
 	}
 
 	ledgerSvc := ledger.NewService(db)
-	api := httpapi.New(ledgerSvc, webhook.NewStore(db), map[string][]byte{provider: []byte(secret)}, log)
+	m := metrics.New()
+	api := httpapi.New(httpapi.Deps{
+		Ledger:         ledgerSvc,
+		Webhooks:       webhook.NewStore(db),
+		WebhookSecrets: map[string][]byte{provider: []byte(secret)},
+		Metrics:        m,
+		Logger:         log,
+		Ready:          db.PingContext,
+	})
 
 	srv := &http.Server{
 		Addr:              ":" + env("PORT", "8080"),
@@ -60,7 +68,7 @@ func run(log *slog.Logger) error {
 	workerDone := make(chan struct{})
 	go func() {
 		defer close(workerDone)
-		webhook.NewWorker(db, ledgerSvc, log).Run(ctx)
+		webhook.NewWorker(db, ledgerSvc, m, log).Run(ctx)
 	}()
 
 	serverErr := make(chan error, 1)
@@ -77,7 +85,6 @@ func run(log *slog.Logger) error {
 	case <-ctx.Done():
 	}
 
-	// Graceful shutdown: stop accepting requests, let in-flight ones finish.
 	log.Info("shutting down")
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()

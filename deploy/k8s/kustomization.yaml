@@ -1,0 +1,38 @@
+# Apply everything with: kubectl apply -k deploy/k8s
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: ledger
+
+resources:
+  - namespace.yaml
+  - postgres.yaml
+  - api.yaml
+  - observability/prometheus.yaml
+  - observability/grafana.yaml
+
+secretGenerator:
+  - name: ledger-secrets
+    options:
+      disableNameSuffixHash: true
+    literals:
+      - POSTGRES_PASSWORD=ledger
+      - DATABASE_URL=postgres://ledger:ledger@postgres:5432/ledger?sslmode=disable
+      - WEBHOOK_SECRET=dev-secret
+
+configMapGenerator:
+  - name: prometheus-config
+    files:
+      - observability/prometheus.yml
+  - name: grafana-datasources
+    files:
+      - observability/grafana-datasources.yaml
+  - name: grafana-dashboard-provider
+    files:
+      - observability/grafana-dashboard-provider.yaml
+  - name: grafana-dashboards
+    files:
+      - observability/ledger-dashboard.json
+
+labels:
+  - pairs:
+      app.kubernetes.io/part-of: go-payments-ledger

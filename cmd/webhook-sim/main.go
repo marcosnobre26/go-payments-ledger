@@ -1,7 +1,3 @@
-// Command webhook-sim simulates a payment provider sending a signed
-// "payment.succeeded" webhook, to try the service locally.
-//
-//	go run ./cmd/webhook-sim -account <uuid> -amount 5000
 package main
 
 import (

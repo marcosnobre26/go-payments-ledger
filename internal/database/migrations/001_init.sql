@@ -1,28 +1,22 @@
--- Accounts hold a cached balance in minor units (cents). The source of truth
--- is ledger_entries; balance is updated in the same transaction as the entries.
 CREATE TABLE IF NOT EXISTS accounts (
     id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     currency    CHAR(3)     NOT NULL,
     balance     BIGINT      NOT NULL DEFAULT 0,
     is_system   BOOLEAN     NOT NULL DEFAULT false,
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
-    -- Customer accounts can never go negative; system (settlement) accounts can.
     CONSTRAINT balance_non_negative CHECK (is_system OR balance >= 0)
 );
 
--- One settlement account per currency, used as the counterpart of deposits.
 CREATE UNIQUE INDEX IF NOT EXISTS uniq_system_account_per_currency
     ON accounts (currency) WHERE is_system;
 
 CREATE TABLE IF NOT EXISTS transactions (
     id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     kind        TEXT        NOT NULL CHECK (kind IN ('transfer', 'deposit')),
-    -- External reference (e.g. webhook event id). UNIQUE = second idempotency layer.
     reference   TEXT UNIQUE,
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
--- Double-entry ledger: every transaction has entries that sum to zero.
 CREATE TABLE IF NOT EXISTS ledger_entries (
     id              BIGSERIAL PRIMARY KEY,
     transaction_id  UUID        NOT NULL REFERENCES transactions (id),
@@ -55,7 +49,6 @@ CREATE TABLE IF NOT EXISTS webhook_events (
     last_error       TEXT,
     received_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     processed_at     TIMESTAMPTZ,
-    -- Providers retry deliveries: the same event must only be stored once.
     UNIQUE (provider, event_id)
 );
 

@@ -10,9 +10,9 @@ import (
 	"time"
 
 	"github.com/marcosnobre26/go-payments-ledger/internal/ledger"
+	"github.com/marcosnobre26/go-payments-ledger/internal/metrics"
 )
 
-// Event is the payload sent by the payment provider.
 type Event struct {
 	ID   string `json:"id"`
 	Type string `json:"type"`
@@ -27,9 +27,6 @@ const EventPaymentSucceeded = "payment.succeeded"
 
 var errMalformedPayload = errors.New("malformed event payload")
 
-// Store persists incoming events. Receiving and processing are separated so
-// the endpoint answers the provider in milliseconds, regardless of how long
-// processing takes or whether it fails.
 type Store struct {
 	db *sql.DB
 }
@@ -38,8 +35,6 @@ func NewStore(db *sql.DB) *Store {
 	return &Store{db: db}
 }
 
-// Save stores the event once. It returns duplicate=true when the provider
-// redelivers an event that was already received.
 func (s *Store) Save(ctx context.Context, provider string, ev Event, raw []byte) (duplicate bool, err error) {
 	res, err := s.db.ExecContext(ctx, `
 		INSERT INTO webhook_events (provider, event_id, event_type, payload)
@@ -53,25 +48,24 @@ func (s *Store) Save(ctx context.Context, provider string, ev Event, raw []byte)
 	return n == 0, err
 }
 
-// Worker polls pending events and applies them to the ledger.
 type Worker struct {
 	db          *sql.DB
 	ledger      *ledger.Service
+	metrics     *metrics.Metrics
 	log         *slog.Logger
 	interval    time.Duration
 	maxAttempts int
 }
 
-func NewWorker(db *sql.DB, l *ledger.Service, log *slog.Logger) *Worker {
-	return &Worker{db: db, ledger: l, log: log, interval: time.Second, maxAttempts: 8}
+func NewWorker(db *sql.DB, l *ledger.Service, m *metrics.Metrics, log *slog.Logger) *Worker {
+	return &Worker{db: db, ledger: l, metrics: m, log: log, interval: time.Second, maxAttempts: 8}
 }
 
-// Run processes events until ctx is cancelled.
 func (w *Worker) Run(ctx context.Context) {
 	ticker := time.NewTicker(w.interval)
 	defer ticker.Stop()
 	for {
-		// Drain everything that is due, then wait for the next tick.
+
 		for {
 			processed, err := w.ProcessNext(ctx)
 			if err != nil && ctx.Err() == nil {
@@ -81,6 +75,7 @@ func (w *Worker) Run(ctx context.Context) {
 				break
 			}
 		}
+		w.updateBacklog(ctx)
 		select {
 		case <-ctx.Done():
 			return
@@ -89,14 +84,12 @@ func (w *Worker) Run(ctx context.Context) {
 	}
 }
 
-// ProcessNext handles one due event. FOR UPDATE SKIP LOCKED lets several
-// worker replicas run in parallel without picking the same event.
 func (w *Worker) ProcessNext(ctx context.Context) (processed bool, err error) {
 	tx, err := w.db.BeginTx(ctx, nil)
 	if err != nil {
 		return false, err
 	}
-	defer tx.Rollback() //nolint:errcheck
+	defer tx.Rollback()
 
 	var (
 		id       int64
@@ -120,16 +113,16 @@ func (w *Worker) ProcessNext(ctx context.Context) (processed bool, err error) {
 		return false, err
 	}
 
-	// A savepoint lets us undo a failed ledger posting while still recording
-	// the failed attempt in the same transaction.
 	if _, err := tx.ExecContext(ctx, `SAVEPOINT apply_event`); err != nil {
 		return false, err
 	}
 	applyErr := w.apply(ctx, tx, provider, eventID, payload)
 
 	log := w.log.With("event_id", eventID, "provider", provider, "attempt", attempts+1)
+	var result string
 	switch {
 	case applyErr == nil:
+		result = "processed"
 		_, err = tx.ExecContext(ctx, `
 			UPDATE webhook_events
 			SET status = 'processed', attempts = attempts + 1, processed_at = now(), last_error = NULL
@@ -137,6 +130,7 @@ func (w *Worker) ProcessNext(ctx context.Context) (processed bool, err error) {
 		log.Info("webhook processed")
 
 	case ledger.IsPermanent(applyErr) || errors.Is(applyErr, errMalformedPayload) || attempts+1 >= w.maxAttempts:
+		result = "failed"
 		if _, err := tx.ExecContext(ctx, `ROLLBACK TO SAVEPOINT apply_event`); err != nil {
 			return false, err
 		}
@@ -147,6 +141,7 @@ func (w *Worker) ProcessNext(ctx context.Context) (processed bool, err error) {
 		log.Warn("webhook failed permanently", "error", applyErr)
 
 	default:
+		result = "retry"
 		if _, err := tx.ExecContext(ctx, `ROLLBACK TO SAVEPOINT apply_event`); err != nil {
 			return false, err
 		}
@@ -161,7 +156,21 @@ func (w *Worker) ProcessNext(ctx context.Context) (processed bool, err error) {
 	if err != nil {
 		return false, err
 	}
-	return true, tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	
+	w.metrics.WebhooksProcessed.Inc(result)
+	return true, nil
+}
+
+func (w *Worker) updateBacklog(ctx context.Context) {
+	var pending int64
+	if err := w.db.QueryRowContext(ctx,
+		`SELECT count(*) FROM webhook_events WHERE status = 'pending'`,
+	).Scan(&pending); err == nil {
+		w.metrics.WebhooksPending.Set(float64(pending))
+	}
 }
 
 func (w *Worker) apply(ctx context.Context, tx *sql.Tx, provider, eventID string, payload []byte) error {
@@ -174,13 +183,10 @@ func (w *Worker) apply(ctx context.Context, tx *sql.Tx, provider, eventID string
 		reference := provider + ":" + eventID
 		return w.ledger.DepositTx(ctx, tx, ev.Data.AccountID, ev.Data.Amount, ev.Data.Currency, reference)
 	default:
-		// Unknown event types are acknowledged and ignored, so providers can
-		// add new events without breaking the integration.
 		return nil
 	}
 }
 
-// backoff returns an exponential delay: 2s, 4s, 8s... capped at 10 minutes.
 func backoff(attempt int) time.Duration {
 	d := time.Duration(1<<attempt) * time.Second
 	if d > 10*time.Minute {

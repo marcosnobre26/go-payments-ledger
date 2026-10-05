@@ -104,8 +104,6 @@ func TestTransferIsIdempotent(t *testing.T) {
 	}
 }
 
-// Many concurrent transfers must never overdraw the account: exactly
-// balance/amount of them succeed and the rest fail with insufficient funds.
 func TestConcurrentTransfersNeverOverdraw(t *testing.T) {
 	svc := ledger.NewService(testutil.DB(t))
 	from, to := newFundedAccount(t, svc, 1_000), newFundedAccount(t, svc, 0)

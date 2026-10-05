@@ -14,6 +14,7 @@ import (
 
 	"github.com/marcosnobre26/go-payments-ledger/internal/httpapi"
 	"github.com/marcosnobre26/go-payments-ledger/internal/ledger"
+	"github.com/marcosnobre26/go-payments-ledger/internal/metrics"
 	"github.com/marcosnobre26/go-payments-ledger/internal/testutil"
 	"github.com/marcosnobre26/go-payments-ledger/internal/webhook"
 )
@@ -21,19 +22,24 @@ import (
 var secret = []byte("test-secret")
 
 type env struct {
-	srv    *httptest.Server
-	ledger *ledger.Service
-	worker *webhook.Worker
+	srv     *httptest.Server
+	ledger  *ledger.Service
+	worker  *webhook.Worker
+	metrics *metrics.Metrics
 }
 
 func setup(t *testing.T) env {
 	db := testutil.DB(t)
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	l := ledger.NewService(db)
-	api := httpapi.New(l, webhook.NewStore(db), map[string][]byte{"acmepay": secret}, log)
+	m := metrics.New()
+	api := httpapi.New(httpapi.Deps{
+		Ledger: l, Webhooks: webhook.NewStore(db), WebhookSecrets: map[string][]byte{"acmepay": secret},
+		Metrics: m, Logger: log, Ready: db.PingContext,
+	})
 	srv := httptest.NewServer(api.Handler())
 	t.Cleanup(srv.Close)
-	return env{srv: srv, ledger: l, worker: webhook.NewWorker(db, l, log)}
+	return env{srv: srv, ledger: l, worker: webhook.NewWorker(db, l, m, log), metrics: m}
 }
 
 func sendWebhook(t *testing.T, e env, sign []byte, eventID, accountID string, amount int64) *http.Response {
@@ -89,6 +95,37 @@ func TestWebhookDeliveredTwiceCreditsOnce(t *testing.T) {
 	got, _ := e.ledger.GetAccount(context.Background(), acc.ID)
 	if got.Balance != 5_000 {
 		t.Fatalf("balance = %d, want 5000 (credited once)", got.Balance)
+	}
+	if n := e.metrics.WebhooksReceived.Value("acmepay", "true"); n != 1 {
+		t.Fatalf("duplicate counter = %v, want 1", n)
+	}
+	if n := e.metrics.WebhooksProcessed.Value("processed"); n < 1 {
+		t.Fatalf("processed counter = %v, want >= 1", n)
+	}
+}
+
+func TestMetricsAndReadinessEndpoints(t *testing.T) {
+	e := setup(t)
+	for _, path := range []string{"/healthz", "/readyz"} {
+		resp, err := http.Get(e.srv.URL + path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("%s status = %d, want 200", path, resp.StatusCode)
+		}
+	}
+
+	resp, err := http.Get(e.srv.URL + "/metrics")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	want := `http_requests_total{method="GET",route="/readyz",status="200"} 1`
+	if !bytes.Contains(body, []byte(want)) {
+		t.Fatalf("metrics output missing %q:\n%s", want, body)
 	}
 }
 

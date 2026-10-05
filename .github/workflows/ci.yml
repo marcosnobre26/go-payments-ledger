@@ -32,3 +32,12 @@ jobs:
         env:
           TEST_DATABASE_URL: postgres://ledger:ledger@localhost:5432/ledger?sslmode=disable
         run: go test -race -count=1 -p 1 ./...
+
+  manifests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate Kubernetes manifests
+        run: |
+          curl -sL https://github.com/yannh/kubeconform/releases/download/v0.6.7/kubeconform-linux-amd64.tar.gz | tar xz
+          kubectl kustomize deploy/k8s | ./kubeconform -strict -summary -kubernetes-version 1.30.0

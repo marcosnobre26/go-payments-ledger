@@ -1,4 +1,3 @@
-// Package testutil provides a migrated PostgreSQL connection for integration tests.
 package testutil
 
 import (
@@ -10,8 +9,6 @@ import (
 	"github.com/marcosnobre26/go-payments-ledger/internal/database"
 )
 
-// DB returns a connection to TEST_DATABASE_URL, or skips the test when the
-// variable is not set (so `go test ./...` works without a database).
 func DB(t *testing.T) *sql.DB {
 	t.Helper()
 	dsn := os.Getenv("TEST_DATABASE_URL")

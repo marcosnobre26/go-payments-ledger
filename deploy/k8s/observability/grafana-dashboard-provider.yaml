@@ -1,0 +1,7 @@
+apiVersion: 1
+providers:
+  - name: ledger
+    folder: go-payments-ledger
+    type: file
+    options:
+      path: /etc/grafana/dashboards
