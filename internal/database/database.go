@@ -12,6 +12,7 @@ import (
 	"time"
 )
 
+//go:embed migrations/*.sql
 var migrations embed.FS
 
 func Open(ctx context.Context, dsn string) (*sql.DB, error) {
