@@ -2,7 +2,7 @@
 
 A payments microservice in Go: a **double-entry ledger** with **idempotent transfers** and a **secure webhook receiver** that processes payment-provider events asynchronously, with retries. It runs locally with Docker Compose or on Kubernetes, with Prometheus metrics and a Grafana dashboard.
 
-![CI](https://github.com/marcosnobre26/go-payments-ledger/actions/workflows/ci.yml/badge.svg)
+[![CI](https://github.com/marcosnobre26/go-payments-ledger/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/marcosnobre26/go-payments-ledger/actions/workflows/ci.yml)
 
 ## Contents
 
