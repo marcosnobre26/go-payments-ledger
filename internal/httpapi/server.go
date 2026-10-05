@@ -36,7 +36,7 @@ type Deps struct {
 	WebhookSecrets map[string][]byte
 	Metrics        *metrics.Metrics
 	Logger         *slog.Logger
-	Ready func(context.Context) error
+	Ready          func(context.Context) error
 }
 
 func New(d Deps) *Server {

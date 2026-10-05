@@ -159,7 +159,7 @@ func (w *Worker) ProcessNext(ctx context.Context) (processed bool, err error) {
 	if err := tx.Commit(); err != nil {
 		return false, err
 	}
-	
+
 	w.metrics.WebhooksProcessed.Inc(result)
 	return true, nil
 }

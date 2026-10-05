@@ -6,10 +6,10 @@ import (
 	"database/sql"
 	"embed"
 	"fmt"
+	_ "github.com/lib/pq"
 	"io/fs"
 	"sort"
 	"time"
-	_ "github.com/lib/pq"
 )
 
 var migrations embed.FS
