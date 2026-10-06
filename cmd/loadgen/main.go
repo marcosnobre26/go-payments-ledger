@@ -83,23 +83,41 @@ func (c *client) randomAction(ids []string) {
 		to = ids[mrand.Intn(len(ids))]
 	}
 	switch p := mrand.Intn(100); {
-	case p < 50:
+	case p < 42:
 		c.transfer(randomID("key"), from, to, int64(100+mrand.Intn(5_000)))
-	case p < 60:
+	case p < 50:
 		key := randomID("key")
 		c.transfer(key, from, to, 1_000)
 		c.transfer(key, from, to, 1_000)
-	case p < 68:
+	case p < 56:
 		c.transfer(randomID("key"), from, to, 10_000_000)
-	case p < 85:
+	case p < 72:
 		c.deposit(to, int64(1_000+mrand.Intn(20_000)), randomID("evt"))
-	case p < 95:
+	case p < 80:
 		ev := randomID("evt")
 		c.deposit(to, 5_000, ev)
 		c.deposit(to, 5_000, ev)
+	case p < 90:
+		c.payout(randomID("payout"), from, int64(500+mrand.Intn(3_000)), "pix:"+randomID("user")+"@example.com")
+	case p < 93:
+		c.payout(randomID("payout"), from, 1_000, "reject-closed-account")
+	case p < 95:
+		key := randomID("payout")
+		c.payout(key, from, 1_000, "pix:retry@example.com")
+		c.payout(key, from, 1_000, "pix:retry@example.com")
 	default:
 		c.forgedDeposit(to)
 	}
+}
+
+func (c *client) payout(key, account string, amount int64, destination string) {
+	body, _ := json.Marshal(map[string]any{
+		"account_id": account, "amount": amount, "currency": "BRL", "destination": destination,
+	})
+	req, _ := http.NewRequest(http.MethodPost, c.base+"/v1/payouts", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Idempotency-Key", key)
+	c.do("payout", req)
 }
 
 func (c *client) createAccount() (string, error) {
@@ -150,7 +168,7 @@ func (c *client) do(label string, req *http.Request) {
 	resp, err := c.http.Do(req)
 	result := "error"
 	if err == nil {
-		io.Copy(io.Discard, resp.Body)
+		io.Copy(io.Discard, resp.Body) //nolint:errcheck
 		resp.Body.Close()
 		result = resp.Status
 	}

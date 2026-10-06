@@ -1,4 +1,3 @@
-// Package database opens the PostgreSQL connection and applies migrations.
 package database
 
 import (
@@ -6,10 +5,11 @@ import (
 	"database/sql"
 	"embed"
 	"fmt"
-	_ "github.com/lib/pq"
 	"io/fs"
 	"sort"
 	"time"
+
+	_ "github.com/lib/pq"
 )
 
 //go:embed migrations/*.sql
@@ -56,7 +56,7 @@ func Migrate(ctx context.Context, db *sql.DB) error {
 	if _, err := conn.ExecContext(ctx, `SELECT pg_advisory_lock($1)`, migrationLockID); err != nil {
 		return fmt.Errorf("acquire migration lock: %w", err)
 	}
-	defer conn.ExecContext(context.Background(), `SELECT pg_advisory_unlock($1)`, migrationLockID)
+	defer conn.ExecContext(context.Background(), `SELECT pg_advisory_unlock($1)`, migrationLockID) //nolint:errcheck
 
 	for _, name := range files {
 		script, err := migrations.ReadFile(name)

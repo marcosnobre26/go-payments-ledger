@@ -1,11 +1,16 @@
+# One-off Job that populates the database with demo data.
+# Not part of kustomization.yaml on purpose: it runs only when you ask for it.
+#   kubectl -n ledger delete job seed --ignore-not-found
+#   kubectl apply -f deploy/k8s/jobs/seed-job.yaml
+#   kubectl -n ledger logs -f job/seed
 apiVersion: batch/v1
 kind: Job
 metadata:
   name: seed
   namespace: ledger
 spec:
-  backoffLimit: 0
-  ttlSecondsAfterFinished: 3600
+  backoffLimit: 0 # do not retry automatically: a failed seed should be inspected
+  ttlSecondsAfterFinished: 3600 # cleaned up after 1 hour
   template:
     metadata:
       labels:

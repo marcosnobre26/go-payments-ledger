@@ -28,6 +28,10 @@ var (
 	uuidRe     = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
 )
 
+func ValidCurrency(c string) bool { return currencyRe.MatchString(c) }
+
+func ValidID(id string) bool { return uuidRe.MatchString(id) }
+
 func IsPermanent(err error) bool {
 	for _, target := range []error{
 		ErrAccountNotFound, ErrInsufficientFunds, ErrCurrencyMismatch,
@@ -162,7 +166,7 @@ func (s *Service) Transfer(ctx context.Context, idempotencyKey string, in Transf
 	if err != nil {
 		return Transfer{}, false, err
 	}
-	defer tx.Rollback()
+	defer tx.Rollback() //nolint:errcheck // no-op after Commit
 
 	res, err := tx.ExecContext(ctx,
 		`INSERT INTO idempotency_keys (key, request_hash) VALUES ($1, $2) ON CONFLICT (key) DO NOTHING`,
@@ -209,7 +213,7 @@ func (s *Service) Deposit(ctx context.Context, accountID string, amount int64, c
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	defer tx.Rollback() //nolint:errcheck
 	if err := s.DepositTx(ctx, tx, accountID, amount, currency, reference); err != nil {
 		return err
 	}
@@ -226,24 +230,47 @@ func (s *Service) DepositTx(ctx context.Context, tx *sql.Tx, accountID string, a
 	if amount <= 0 {
 		return ErrInvalidAmount
 	}
-
-	if _, err := tx.ExecContext(ctx, `
-		INSERT INTO accounts (currency, is_system) VALUES ($1, true)
-		ON CONFLICT (currency) WHERE is_system DO NOTHING`, currency); err != nil {
+	settlementID, err := SystemAccountTx(ctx, tx, currency, RoleSettlement)
+	if err != nil {
 		return err
 	}
-	var settlementID string
-	if err := tx.QueryRowContext(ctx,
-		`SELECT id FROM accounts WHERE is_system AND currency = $1`, currency,
-	).Scan(&settlementID); err != nil {
-		return err
-	}
-
-	_, _, err := post(ctx, tx, "deposit", &reference, settlementID, accountID, amount, currency)
+	_, _, err = post(ctx, tx, "deposit", &reference, settlementID, accountID, amount, currency)
 	return err
 }
 
+const (
+	RoleSettlement = "settlement"
+
+	RoleClearing = "clearing"
+)
+
+func SystemAccountTx(ctx context.Context, tx *sql.Tx, currency, role string) (string, error) {
+	if !currencyRe.MatchString(currency) {
+		return "", ErrInvalidCurrency
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO accounts (currency, is_system, system_role) VALUES ($1, true, $2)
+		ON CONFLICT (currency, system_role) WHERE is_system DO NOTHING`, currency, role); err != nil {
+		return "", err
+	}
+	var id string
+	err := tx.QueryRowContext(ctx,
+		`SELECT id FROM accounts WHERE is_system AND currency = $1 AND system_role = $2`, currency, role,
+	).Scan(&id)
+	return id, err
+}
+
+func PostTx(ctx context.Context, tx *sql.Tx, kind, reference, from, to string, amount int64, currency string) (string, error) {
+	var ref *string
+	if reference != "" {
+		ref = &reference
+	}
+	id, _, err := post(ctx, tx, kind, ref, from, to, amount, currency)
+	return id, err
+}
+
 func post(ctx context.Context, tx *sql.Tx, kind string, reference *string, from, to string, amount int64, currency string) (string, time.Time, error) {
+
 	ids := []string{from, to}
 	sort.Strings(ids)
 

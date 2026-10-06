@@ -14,6 +14,7 @@ import (
 	"github.com/marcosnobre26/go-payments-ledger/internal/httpapi"
 	"github.com/marcosnobre26/go-payments-ledger/internal/ledger"
 	"github.com/marcosnobre26/go-payments-ledger/internal/metrics"
+	"github.com/marcosnobre26/go-payments-ledger/internal/payout"
 	"github.com/marcosnobre26/go-payments-ledger/internal/webhook"
 )
 
@@ -47,10 +48,23 @@ func run(log *slog.Logger) error {
 
 	ledgerSvc := ledger.NewService(db)
 	m := metrics.New()
+	worker := webhook.NewWorker(db, ledgerSvc, m, log)
+
+	var payoutSvc *payout.Service
+	if providerURL := os.Getenv("PAYOUT_PROVIDER_URL"); providerURL != "" {
+		payoutSvc = payout.NewService(db, payout.NewHTTPProvider(providerURL), m, log)
+		if d, err := time.ParseDuration(os.Getenv("PAYOUT_STALE_AFTER")); err == nil {
+			payoutSvc.StaleAfter = d
+		}
+		worker.WithPayouts(payoutSvc)
+		log.Info("payouts enabled", "provider_url", providerURL, "stale_after", payoutSvc.StaleAfter.String())
+	}
+
 	api := httpapi.New(httpapi.Deps{
 		Ledger:         ledgerSvc,
 		Webhooks:       webhook.NewStore(db),
 		WebhookSecrets: map[string][]byte{provider: []byte(secret)},
+		Payouts:        payoutSvc,
 		Metrics:        m,
 		Logger:         log,
 		Ready:          db.PingContext,
@@ -68,8 +82,11 @@ func run(log *slog.Logger) error {
 	workerDone := make(chan struct{})
 	go func() {
 		defer close(workerDone)
-		webhook.NewWorker(db, ledgerSvc, m, log).Run(ctx)
+		worker.Run(ctx)
 	}()
+	if payoutSvc != nil {
+		go payoutSvc.RunReconciler(ctx, 5*time.Second)
+	}
 
 	serverErr := make(chan error, 1)
 	go func() {

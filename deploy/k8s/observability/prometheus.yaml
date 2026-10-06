@@ -1,3 +1,4 @@
+# Prometheus needs read access to pods in the namespace for service discovery.
 apiVersion: v1
 kind: ServiceAccount
 metadata:

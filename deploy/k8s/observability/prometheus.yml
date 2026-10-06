@@ -3,6 +3,9 @@ global:
   evaluation_interval: 5s
 
 scrape_configs:
+  # Discovers API pods through the Kubernetes API and scrapes every pod
+  # annotated with prometheus.io/scrape: "true". Scaling the Deployment adds
+  # or removes targets automatically.
   - job_name: ledger-api
     kubernetes_sd_configs:
       - role: pod

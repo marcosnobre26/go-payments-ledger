@@ -15,6 +15,8 @@ kind: Deployment
 metadata:
   name: api
 spec:
+  # Several replicas both serve HTTP and run the webhook worker. They never
+  # process the same event twice thanks to SELECT ... FOR UPDATE SKIP LOCKED.
   replicas: 2
   selector:
     matchLabels:
@@ -22,27 +24,28 @@ spec:
   strategy:
     type: RollingUpdate
     rollingUpdate:
-      maxUnavailable: 0
+      maxUnavailable: 0 # zero-downtime deploys
       maxSurge: 1
   template:
     metadata:
       labels:
         app: api
       annotations:
+        # Picked up by Prometheus' Kubernetes service discovery.
         prometheus.io/scrape: "true"
         prometheus.io/port: "8080"
     spec:
-      terminationGracePeriodSeconds: 30
+      terminationGracePeriodSeconds: 30 # matches the graceful shutdown window
       securityContext:
         runAsNonRoot: true
-        runAsUser: 65532
+        runAsUser: 65532 # "nonroot" user of the distroless image
         runAsGroup: 65532
         seccompProfile:
           type: RuntimeDefault
       containers:
         - name: api
           image: go-payments-ledger:dev
-          imagePullPolicy: IfNotPresent
+          imagePullPolicy: IfNotPresent # image is loaded into kind, not pulled
           ports:
             - name: http
               containerPort: 8080
@@ -51,6 +54,10 @@ spec:
               value: "8080"
             - name: WEBHOOK_PROVIDER
               value: acmepay
+            - name: PAYOUT_PROVIDER_URL
+              value: http://payout-provider
+            - name: PAYOUT_STALE_AFTER
+              value: 30s
             - name: DATABASE_URL
               valueFrom:
                 secretKeyRef:
@@ -61,11 +68,13 @@ spec:
                 secretKeyRef:
                   name: ledger-secrets
                   key: WEBHOOK_SECRET
+          # Liveness: restart the container if the process hangs.
           livenessProbe:
             httpGet:
               path: /healthz
               port: http
             periodSeconds: 10
+          # Readiness: only receive traffic while the database is reachable.
           readinessProbe:
             httpGet:
               path: /readyz

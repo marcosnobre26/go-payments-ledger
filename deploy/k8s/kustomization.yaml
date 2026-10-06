@@ -7,13 +7,16 @@ resources:
   - namespace.yaml
   - postgres.yaml
   - api.yaml
+  - payout-provider.yaml
   - observability/prometheus.yaml
   - observability/grafana.yaml
 
+# Local development credentials only. In a real cluster these come from a
+# secret manager (e.g. AWS Secrets Manager via External Secrets), never git.
 secretGenerator:
   - name: ledger-secrets
     options:
-      disableNameSuffixHash: true
+      disableNameSuffixHash: true # fixed name so the seed Job can reference it
     literals:
       - POSTGRES_PASSWORD=ledger
       - DATABASE_URL=postgres://ledger:ledger@postgres:5432/ledger?sslmode=disable

@@ -51,7 +51,7 @@ func run() error {
 	if *reset {
 		fmt.Println("reset: truncating all tables")
 		if _, err := db.ExecContext(ctx, `
-			TRUNCATE idempotency_keys, ledger_entries, transactions, webhook_events, accounts
+			TRUNCATE payouts, idempotency_keys, ledger_entries, transactions, webhook_events, accounts
 			RESTART IDENTITY CASCADE`); err != nil {
 			return fmt.Errorf("reset: %w", err)
 		}
@@ -92,16 +92,18 @@ func run() error {
 			currency = "USD"
 		}
 		eventID := fmt.Sprintf("evt_seed_%s_%03d", runID, i)
-		amount := int64(50_000 + rng.Intn(450_000)) // R$500.00 to R$5,000.00
+		amount := int64(50_000 + rng.Intn(450_000))
 		if err := saveEvent(eventID, id, amount, currency); err != nil {
 			return err
 		}
+
 		if i%5 == 0 {
 			if err := saveEvent(eventID, id, amount, currency); err != nil {
 				return err
 			}
 		}
 	}
+
 	if err := saveEvent("evt_seed_"+runID+"_orphan", "00000000-0000-0000-0000-000000000000", 10_000, "BRL"); err != nil {
 		return err
 	}

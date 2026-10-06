@@ -1,8 +1,8 @@
 # go-payments-ledger
 
-A payments microservice in Go: a **double-entry ledger** with **idempotent transfers** and a **secure webhook receiver** that processes payment-provider events asynchronously, with retries. It runs locally with Docker Compose or on Kubernetes, with Prometheus metrics and a Grafana dashboard.
+A payments microservice in Go: a **double-entry ledger** with **idempotent transfers**, **payouts through an external provider** that survive crashes without paying twice, and a **secure webhook receiver** that processes provider events asynchronously, with retries. It runs locally with Docker Compose or on Kubernetes, with Prometheus metrics and a Grafana dashboard.
 
-[![CI](https://github.com/marcosnobre26/go-payments-ledger/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/marcosnobre26/go-payments-ledger/actions/workflows/ci.yml)
+![CI](https://github.com/marcosnobre26/go-payments-ledger/actions/workflows/ci.yml/badge.svg)
 
 ## Contents
 
@@ -10,6 +10,7 @@ A payments microservice in Go: a **double-entry ledger** with **idempotent trans
 - [Features](#features)
 - [Architecture](#architecture)
 - [Design decisions](#design-decisions)
+- [Payouts: calling an external provider safely](#payouts-calling-an-external-provider-safely)
 - [Quick start (Docker Compose)](#quick-start-docker-compose)
 - [API reference](#api-reference)
 - [Kubernetes](#kubernetes)
@@ -28,6 +29,7 @@ Any product that moves money (digital wallets, marketplaces, subscription platfo
 
 - **Never move money twice.** Clients and networks retry requests. A retried transfer must return the original result, not create a second one.
 - **Never lose or double-apply a provider event.** Payment providers (Stripe, Mercado Pago, PagSeguro…) confirm payments through webhooks that can arrive late, out of order or more than once.
+- **Never charge twice when an external provider is involved.** A process can crash after the provider moved the money but before the database commit. The system must still know what happened and settle it exactly once.
 - **Never trust an unsigned request.** Anyone can call a public webhook URL; only events signed by the provider may touch balances.
 - **Never overdraw an account under concurrency.** Two simultaneous transfers from the same account must not both succeed if the balance only covers one.
 - **Always be able to explain every cent.** Balances must be auditable and reconcilable, which is why financial systems use double-entry bookkeeping.
@@ -37,14 +39,16 @@ This project implements those guarantees end to end in a deliberately small doma
 - an **account ledger** where deposits and transfers are recorded as balanced double entries;
 - a **webhook pipeline** that verifies, deduplicates and asynchronously applies `payment.succeeded` events from a payment provider (simulated as `acmepay`);
 - an **idempotent transfer API** that is safe to retry;
+- **payouts** that send money out through a (simulated) payment provider, recorded before the provider is called and reconciled until the provider confirms the outcome;
 - the **operational layer** expected in production: metrics, dashboards, health probes, graceful shutdown and a Kubernetes deployment with multiple replicas.
 
-Out of scope on purpose: authentication/authorization of API clients, currency conversion, refunds and multi-provider configuration. They are natural extensions (see the [Roadmap](#roadmap)) but would not add new ideas to the core problems above.
+Out of scope on purpose: authentication/authorization of API clients, currency conversion, refunds of deposits and multi-provider configuration. They are natural extensions (see the [Roadmap](#roadmap)) but would not add new ideas to the core problems above.
 
 ## Features
 
 - **Double-entry ledger.** Every movement is a transaction whose entries sum to zero. Balances are cached on the account and updated in the same database transaction.
 - **Idempotent transfers.** `POST /v1/transfers` requires an `Idempotency-Key`. A retried request returns the original result (`Idempotent-Replayed: true`); reusing a key with a different payload is rejected.
+- **Crash-safe payouts.** Funds are reserved and the payout is committed as `pending` *before* calling the provider; the provider receives the payout ID as its own idempotency key; webhooks and a reconciler drive every payout to `paid` or `failed`. An unknown outcome is never treated as a failure.
 - **Signed webhooks.** HMAC-SHA256 over `timestamp.body`, constant-time comparison and a 5-minute tolerance window against replay attacks.
 - **Deduplicated, asynchronous processing.** Events are stored once (`UNIQUE (provider, event_id)`), acknowledged immediately with `202`, and applied by a background worker.
 - **Retries with exponential backoff.** Transient failures are retried (2s, 4s, 8s… capped at 10 min); business-rule failures (unknown account, currency mismatch) fail fast.
@@ -66,16 +70,22 @@ flowchart LR
     C[Client] -- Idempotency-Key --> T[POST /v1/transfers]
     T -- one DB transaction --> L
     T --> I[(idempotency_keys)]
+    C -- Idempotency-Key --> PO[POST /v1/payouts]
+    PO -- reserve + pending, one DB transaction --> L
+    PO -- payout ID as idempotency key --> PR[Payout provider]
+    PR -- payout.paid / payout.failed --> R
+    RC[Reconciler] -- resubmit / poll status --> PR
 ```
 
 ### Data model
 
 | Table | Purpose |
 |---|---|
-| `accounts` | Customer accounts (one currency each) and one system *settlement* account per currency, used as the counterpart of deposits. Holds the cached `balance` in minor units. |
-| `transactions` | One row per money movement (`transfer` or `deposit`). `reference` stores the provider event and is `UNIQUE`. |
+| `accounts` | Customer accounts (one currency each) and two system accounts per currency: *settlement* (counterpart of money entering or leaving the platform) and *clearing* (funds reserved for payouts in flight). Holds the cached `balance` in minor units. |
+| `transactions` | One row per money movement (`transfer`, `deposit`, `payout_reserve`, `payout_settle`, `payout_reverse`). `reference` is `UNIQUE`. |
 | `ledger_entries` | The double entries: a negative entry on the source account and a positive one on the destination. They always sum to zero per transaction. |
 | `idempotency_keys` | Request fingerprint and resulting transaction for every `Idempotency-Key`. |
+| `payouts` | Every payout with its status (`pending`, `submitted`, `paid`, `failed`), client idempotency key, provider reference, attempts and when the reconciler should look at it again. |
 | `webhook_events` | Every provider event received, with processing status (`pending`, `processed`, `failed`), attempts and last error. |
 
 ## Design decisions
@@ -91,13 +101,112 @@ flowchart LR
 | Savepoint around each event | A failed posting is rolled back while the failed attempt is still recorded in the same transaction. |
 | `transactions.reference` is `UNIQUE` | A second idempotency layer: the same provider event can never produce two deposits. |
 | Seeds go through the domain services, not raw `INSERT`s | Seeded data obeys the same invariants as production data. |
+| Payout committed as `pending` before calling the provider | The intent and the reserved funds are durable before any external side effect. |
+| Payout ID sent as the provider's idempotency key | Resubmitting after a crash or timeout returns the existing payout instead of paying again. |
+| Unknown provider outcomes stay in flight | Only an explicit rejection releases funds; a timeout or 5xx might have paid. |
+
+## Payouts: calling an external provider safely
+
+Transfers only move money inside the ledger, so one database transaction is enough to make them idempotent. A **payout** is different: the money leaves the platform through an external provider, and no database transaction can include the provider's side effect. The classic failure:
+
+1. the service calls the provider;
+2. the provider pays;
+3. the service crashes (or the response times out) **before** recording anything.
+
+If nothing was recorded first, the system has no trace of the payout, and a retry would pay a second time.
+
+### The flow
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant A as API
+    participant DB as PostgreSQL
+    participant P as Provider
+    C->>A: POST /v1/payouts (Idempotency-Key)
+    A->>DB: BEGIN: insert payout 'pending' + reserve funds (account -> clearing): COMMIT
+    A->>P: create payout (Idempotency-Key = payout ID)
+    alt provider accepts
+        P-->>A: 201 processing
+        A->>DB: status 'submitted'
+    else provider rejects
+        P-->>A: 422
+        A->>DB: status 'failed' + release funds (clearing -> account)
+    else timeout / 5xx / crash
+        A->>DB: stays 'pending' (outcome unknown)
+    end
+    A-->>C: 202 Accepted (current status)
+    P-)A: webhook payout.paid / payout.failed
+    A->>DB: 'paid' (clearing -> settlement) or 'failed' (clearing -> account)
+```
+
+1. **Commit first.** In one database transaction, the payout is inserted as `pending` with the client's `Idempotency-Key`, and the funds move from the account to the **clearing** account. Insufficient funds or an unknown account roll everything back, and the key is not consumed.
+2. **Call the provider with a stable key.** The payout ID is sent as the provider's own `Idempotency-Key`. If the same payout is submitted again, the provider returns the payout it already has.
+3. **Settle from the provider, never from a guess.**
+   - `payout.paid` (webhook, or the provider's response) moves the funds from clearing to **settlement**: the money has left the platform.
+   - `payout.failed`, or a synchronous rejection (`4xx`), returns the funds to the account.
+   - A timeout, a `5xx` or a crash leaves the payout `pending`. It might have been paid, so the funds stay reserved.
+
+### States
+
+```mermaid
+stateDiagram-v2
+    [*] --> pending: funds reserved
+    pending --> submitted: provider accepted
+    pending --> failed: provider rejected
+    pending --> paid: webhook arrived before the response was recorded
+    submitted --> paid: webhook or reconciler
+    submitted --> failed: webhook or reconciler
+    paid --> [*]
+    failed --> [*]
+```
+
+`paid` and `failed` are final. A late or duplicated event for a final payout is a no-op; a contradicting one (`failed` after `paid`) is rejected and kept as a failed webhook event for investigation.
+
+### Reconciliation
+
+Every API replica runs a reconciler every 5 seconds. It takes a short **lease** on each due payout (`FOR UPDATE SKIP LOCKED`), so replicas never work on the same payout at the same time:
+
+| Situation | What the reconciler does |
+|---|---|
+| `pending` (the provider call failed or the process died after the commit) | Resubmits with the **same** idempotency key, with exponential backoff. If the provider had already created the payout, it returns it, and nothing is paid twice. |
+| `submitted` for longer than `PAYOUT_STALE_AFTER` (webhook lost or delayed) | Asks the provider for the status (`GET /v1/payouts/{id}`) and settles it. |
+
+### Failure scenarios
+
+| What goes wrong | Result |
+|---|---|
+| Crash right after the commit, before calling the provider | Payout stays `pending`; the reconciler submits it. |
+| Provider pays, but its response is lost (timeout/5xx) | Stays `pending`; the resubmission returns the existing payout; the webhook or a status poll settles it. Paid once. |
+| Provider's webhook never arrives | After `PAYOUT_STALE_AFTER`, the reconciler polls the provider. |
+| Webhook delivered twice | Deduplicated by event ID; settling is idempotent anyway. |
+| Webhook arrives before the API recorded `submitted` | Settles directly from `pending`. |
+| Client retries `POST /v1/payouts` | Same `Idempotency-Key` returns the same payout (`200`, `Idempotent-Replayed: true`). |
+| Provider rejects (invalid destination) | `failed`, funds returned to the account immediately. |
+
+All of these are covered by integration tests, including the worst case: response **and** webhook lost.
+
+### The simulated provider
+
+`cmd/fakeprovider` plays the external provider (it is deployed with Docker Compose and Kubernetes). It is idempotent on `Idempotency-Key`, reports outcomes by signed webhook after `WEBHOOK_DELAY`, exposes `GET /v1/payouts/{id}` and `GET /stats` (payouts created vs. submit calls), and injects the failures above:
+
+| Variable | Default | Effect |
+|---|---|---|
+| `FAIL_AFTER_RECORD_RATE` | `0.1` | Share of new payouts that are recorded and then answered with `500` |
+| `DROP_WEBHOOK_RATE` | `0.1` | Share of outcome webhooks that are never delivered |
+| `WEBHOOK_DELAY` | `3s` | Time until the outcome is known |
+| `API_WEBHOOK_URL` | — | Where webhooks are sent |
+
+Destinations starting with `invalid` are rejected immediately (`422`); destinations starting with `reject` are accepted and fail later (`payout.failed`). Anything else is paid.
+
+With failures injected, `GET /stats` on the provider shows more submit calls than payouts created: those are resubmissions that the idempotency key turned into no-ops.
 
 ## Quick start (Docker Compose)
 
 Requirements: Docker, or Go 1.22+ with PostgreSQL 13+.
 
 ```bash
-make up              # Postgres + API on :8080
+make up              # Postgres + API on :8080 + simulated payout provider on :8081
 ```
 
 Try it:
@@ -119,6 +228,14 @@ curl -s -X POST localhost:8080/v1/transfers \
   -d "{\"from_account_id\":\"$A\",\"to_account_id\":\"$B\",\"amount\":2500,\"currency\":\"BRL\"}"
 
 curl -s localhost:8080/v1/accounts/$A/entries         # account statement
+
+# pay R$15.00 out to an external destination
+P=$(curl -s -X POST localhost:8080/v1/payouts \
+  -H "Idempotency-Key: payout-1" \
+  -d "{\"account_id\":\"$A\",\"amount\":1500,\"currency\":\"BRL\",\"destination\":\"pix:marcos@example.com\"}" | jq -r .id)
+
+curl -s localhost:8080/v1/payouts/$P                  # pending/submitted, then paid a few seconds later
+curl -s localhost:8081/stats                          # provider side: payouts created vs. submit calls
 ```
 
 `make down` stops everything and removes the database volume.
@@ -138,17 +255,19 @@ Errors always have the same shape:
 | Code | Status | When |
 |---|---|---|
 | `invalid_json` | 400 | Malformed body or unknown fields |
-| `validation_error` | 400 | Invalid currency, non-positive amount, same source and destination |
-| `missing_idempotency_key` | 400 | `POST /v1/transfers` without `Idempotency-Key` (or longer than 255 chars) |
+| `validation_error` | 400 | Invalid currency, non-positive amount, same source and destination, missing payout destination |
+| `missing_idempotency_key` | 400 | `POST /v1/transfers` or `POST /v1/payouts` without `Idempotency-Key` (or longer than 255 chars) |
 | `invalid_event` | 400 | Webhook body is not JSON or lacks `id`/`type` |
 | `invalid_signature` | 401 | Missing, malformed, expired or wrong webhook signature |
 | `account_not_found` | 404 | Unknown or malformed account ID |
+| `payout_not_found` | 404 | Unknown or malformed payout ID |
 | `unknown_provider` | 404 | Webhook path for a provider that is not configured |
 | `body_too_large` | 413 | Body above 1 MiB |
 | `insufficient_funds` | 422 | Source balance lower than the amount |
 | `currency_mismatch` | 422 | Accounts and transfer use different currencies |
 | `idempotency_key_reused` | 422 | Same key sent with a different payload |
 | `not_ready` | 503 | Readiness check failed (database unreachable) |
+| `payouts_disabled` | 503 | `PAYOUT_PROVIDER_URL` is not configured |
 | `internal_error` | 500 | Unexpected error (details only in the logs) |
 
 ### `POST /v1/accounts`
@@ -235,6 +354,51 @@ Errors: `400 missing_idempotency_key`, `400 validation_error`, `404 account_not_
 
 A transfer that fails (e.g. insufficient funds) does **not** consume its key, so the client can retry with the same key once the balance allows it.
 
+### `POST /v1/payouts`
+
+Sends money from an account to an external destination through the payout provider. **Requires** an `Idempotency-Key` header. See [Payouts](#payouts-calling-an-external-provider-safely) for the full flow.
+
+```http
+POST /v1/payouts
+Content-Type: application/json
+Idempotency-Key: withdrawal-7731
+
+{
+  "account_id": "6f1c1d0e-8a2b-4a55-9f3e-2b9c7a1d4e10",
+  "amount": 1500,
+  "currency": "BRL",
+  "destination": "pix:marcos@example.com"
+}
+```
+
+| Response | Meaning |
+|---|---|
+| `202 Accepted` | Payout created and funds reserved. The final outcome arrives later. |
+| `200 OK` + header `Idempotent-Replayed: true` | Key already used with the same payload: the existing payout is returned. |
+
+```json
+{
+  "id": "c3d1…",
+  "account_id": "6f1c1d0e-…",
+  "amount": 1500,
+  "currency": "BRL",
+  "destination": "pix:marcos@example.com",
+  "status": "submitted",
+  "provider_ref": "po_8f2a…",
+  "attempts": 1,
+  "created_at": "2026-10-05T12:10:00Z",
+  "updated_at": "2026-10-05T12:10:00Z"
+}
+```
+
+`status` is `pending` (provider not confirmed yet; `last_error` shows why), `submitted` (accepted, waiting for the outcome), `paid` or `failed`. The account balance drops when the payout is created (funds reserved) and only comes back if the payout fails.
+
+Errors: `400 missing_idempotency_key`, `400 validation_error`, `404 account_not_found`, `422 insufficient_funds`, `422 currency_mismatch`, `422 idempotency_key_reused`, `503 payouts_disabled`.
+
+### `GET /v1/payouts/{id}`
+
+Returns the payout and its current status. Errors: `404 payout_not_found`.
+
 ### `POST /v1/webhooks/{provider}`
 
 Receives an event from a payment provider. The default provider name is `acmepay` (configurable with `WEBHOOK_PROVIDER`).
@@ -261,7 +425,9 @@ X-Signature: t=1759665600,v1=5f2b…
 
 - `duplicate: true` means the event ID was already received; it is acknowledged (so the provider stops retrying) and not applied again.
 - The response only means the event was stored. A background worker applies it about a second later.
-- `payment.succeeded` credits the account. Any other event type is acknowledged and ignored, so the provider can add event types without breaking the integration.
+- `payment.succeeded` credits the account (`data.account_id`, `data.amount`, `data.currency`).
+- `payout.paid` and `payout.failed` settle a payout (`data.payout_id`, `data.provider_payout_id`, `data.failure_reason`).
+- Any other event type is acknowledged and ignored, so the provider can add event types without breaking the integration.
 
 Errors: `400 invalid_event`, `401 invalid_signature`, `404 unknown_provider`, `413 body_too_large`.
 
@@ -275,7 +441,7 @@ Errors: `400 invalid_event`, `401 invalid_signature`, `404 unknown_provider`, `4
 
 ### Postman
 
-A Postman collection with every request, automatic webhook signing and response tests lives in `docs/go-payments-ledger.postman_collection.json`. Import it, run the **1. Setup** folder first, then **2. Webhooks** and **3. Transfers**. `base_url` defaults to `http://localhost:8080`.
+A Postman collection with every request, automatic webhook signing and response tests lives in `docs/go-payments-ledger.postman_collection.json`. Import it, run the **1. Setup** folder first, then **2. Webhooks**, **3. Transfers** and **4. Payouts**. `base_url` defaults to `http://localhost:8080`.
 
 ## Kubernetes
 
@@ -285,7 +451,7 @@ Requirements: Docker, `kubectl` and `kind` (`go install sigs.k8s.io/kind@v0.24.0
 
 ```bash
 make k8s-up        # create the cluster, build the image, deploy everything
-make k8s-forward   # API :8080, Prometheus :9090, Grafana :3000 (keep it running)
+make k8s-forward   # API :8080, provider :8081, Prometheus :9090, Grafana :3000 (keep it running)
 make load          # in another terminal: generate realistic traffic
 ```
 
@@ -296,6 +462,8 @@ flowchart LR
         PROM[Prometheus] -- scrapes /metrics --> API1 & API2
         GRAF[Grafana] -- PromQL --> PROM
         SEED[seed Job] -. on demand .-> PG
+        API1 & API2 -- payouts --> PRV[payout-provider]
+        PRV -- webhooks --> API1 & API2
     end
 ```
 
@@ -310,6 +478,7 @@ What the setup demonstrates:
 | Prometheus Kubernetes service discovery | Scaling adds or removes scrape targets automatically. |
 | Routes labelled by pattern (`/v1/accounts/{id}`) | Raw paths with IDs would explode metric cardinality. |
 | Non-root (numeric UID 65532), read-only filesystem, dropped capabilities | Container hardening. The UID is numeric because Kubernetes cannot verify `runAsNonRoot` for a named user. |
+| `payout-provider` Deployment with failure injection | Shows payouts recovering from lost responses and lost webhooks while you watch the dashboard. |
 | Seed as a one-off `Job` | Data loading runs inside the cluster with the same image and secrets as the API. |
 
 Useful commands:
@@ -343,6 +512,7 @@ The dashboard refreshes every 5 seconds. Run `make load` to see it move. Panels:
 - Webhooks received (new vs duplicate) and rejected (forged signatures)
 - Webhook processing results: `processed`, `retry`, `failed`
 - Requests, goroutines and heap per pod
+- Payout lifecycle events (`reserved`, `submitted`, `submit_error`, `resubmitted`, `paid`, `failed`…) and payouts in flight
 
 If panels show **No data**, check the Prometheus targets page first, then make sure traffic is flowing (`make load`).
 
@@ -357,6 +527,8 @@ If panels show **No data**, check the Prometheus targets page first, then make s
 | `webhook_events_rejected_total` | counter | `provider`, `reason` |
 | `webhook_events_processed_total` | counter | `result` (`processed`, `retry`, `failed`) |
 | `webhook_events_pending` | gauge | — (backlog waiting for the worker) |
+| `ledger_payouts_total` | counter | `event` (`reserved`, `submitted`, `submit_error`, `resubmitted`, `rejected`, `paid`, `failed`, `replayed`) |
+| `payouts_in_flight` | gauge | — (`pending` + `submitted`; should return to zero) |
 | `go_goroutines`, `go_memstats_heap_alloc_bytes` | gauge | — |
 
 The metrics package is dependency-free (Prometheus text format written by hand); moving to the official `client_golang` only touches `internal/metrics`.
@@ -473,21 +645,67 @@ SELECT status, COUNT(*) FROM webhook_events GROUP BY status;
 -- failed events and why
 SELECT event_id, attempts, last_error FROM webhook_events WHERE status = 'failed';
 
+-- payouts by status, and the ones still in flight
+SELECT status, COUNT(*) FROM payouts GROUP BY status;
+SELECT id, status, attempts, last_error, next_attempt_at FROM payouts WHERE status IN ('pending', 'submitted');
+
+-- the clearing account holds exactly the payouts in flight (expected: equal values)
+SELECT (SELECT balance FROM accounts WHERE system_role = 'clearing' AND currency = 'BRL') AS clearing_balance,
+       (SELECT COALESCE(SUM(amount), 0) FROM payouts WHERE status IN ('pending', 'submitted') AND currency = 'BRL') AS in_flight;
+
 -- idempotency keys and the transactions they protected
 SELECT key, transaction_id, created_at FROM idempotency_keys ORDER BY created_at DESC LIMIT 10;
 ```
 
 ## Testing
 
+The suite has two layers:
+
+- **Unit tests** have no external dependencies and always run.
+- **Integration tests** run against a real PostgreSQL, because the guarantees this project cares about (locking, constraints, idempotency under concurrency) live in the database. They are skipped automatically when `TEST_DATABASE_URL` is not set.
+
 ```bash
-make test
+make test                     # unit tests only (integration tests are skipped)
+
 docker compose up -d db
-make test-integration
+make test-integration         # everything, against Postgres, with the race detector
 ```
 
-The integration suite covers money movement, insufficient funds, idempotent replay, key reuse, validation, webhook deduplication, signature rejection, metrics and readiness endpoints, and **25 concurrent transfers racing for the same balance** (exactly 10 succeed, the balance never goes negative).
+Other useful commands:
 
-CI runs vet, `gofmt`, the full test suite against PostgreSQL with the race detector, and validates the Kubernetes manifests with `kubeconform`.
+```bash
+go test -v -run TestVerify ./internal/webhook      # run a single test, verbose
+go test -cover ./...                                # coverage per package
+TEST_DATABASE_URL="postgres://ledger:ledger@localhost:5432/ledger?sslmode=disable" \
+  go test -cover -count=1 -p 1 ./...                # coverage including integration tests
+```
+
+`-p 1` runs packages one at a time, since they share the same database. On Windows, `-race` requires a C compiler; drop the flag there (CI on Linux keeps it).
+
+### Unit tests
+
+| File | What it verifies |
+|---|---|
+| `internal/webhook/signature_test.go` | Webhook signature verification: valid signature, tampered body, wrong secret, replay after the 5-minute tolerance, timestamp from the future, missing header, malformed header, missing `v1`. Also that retry backoff is exponential and capped. |
+| `internal/metrics/metrics_test.go` | Prometheus exposition format: counters, cumulative histogram buckets, `_sum`/`_count`, label escaping, and a panic when a metric is used with the wrong number of labels. |
+
+### Integration tests
+
+| File | What it verifies |
+|---|---|
+| `internal/ledger/ledger_test.go` | A transfer moves the exact amount; insufficient funds is rejected without changing balances; the same idempotency key replays the original transfer and a key reused with a different payload is rejected; validation (zero/negative amount, same account, invalid currency, currency mismatch, unknown account); **25 concurrent transfers racing for the same balance**: exactly 10 succeed and the balance never goes negative. |
+| `internal/payout/payout_test.go` | Payouts against the simulated provider: reservation then settlement by webhook; idempotent creation (one provider payout); provider rejection releases funds; `payout.failed` returns funds; **provider pays but both its response and its webhook are lost**: the payout stays reserved, the reconciler resubmits with the same key (still one provider payout), polls the status and settles it exactly once; insufficient funds does not consume the key. Every test checks the ledger stays balanced. |
+| `internal/httpapi/server_test.go` | End to end over HTTP: a webhook delivered twice credits once (and the duplicate/processed metrics reflect it); a forged signature gets `401`; transfers require `Idempotency-Key`, return `201` then `200` with `Idempotent-Replayed: true`; `/healthz`, `/readyz` and `/metrics` respond, with routes labelled by pattern. |
+
+`cmd/seed` adds one more safety net: after seeding it checks that every transaction is balanced and every cached balance matches the ledger, and exits with an error otherwise.
+
+### CI
+
+GitHub Actions runs on every push and pull request:
+
+1. `go vet` and a `gofmt` check;
+2. the full test suite against a PostgreSQL service container, with the race detector;
+3. validation of the Kubernetes manifests with `kustomize` + `kubeconform`.
 
 ## Configuration and Make targets
 
@@ -497,6 +715,8 @@ CI runs vet, `gofmt`, the full test suite against PostgreSQL with the race detec
 | `WEBHOOK_SECRET` | — (required) | Secret used to verify webhook signatures |
 | `WEBHOOK_PROVIDER` | `acmepay` | Provider name in `/v1/webhooks/{provider}` |
 | `PORT` | `8080` | HTTP port |
+| `PAYOUT_PROVIDER_URL` | — (payouts disabled) | Base URL of the payout provider |
+| `PAYOUT_STALE_AFTER` | `2m` | How long a submitted payout waits for a webhook before the reconciler polls the provider |
 
 | Target | Description |
 |---|---|
@@ -529,7 +749,10 @@ cmd/api/              service entrypoint (config, wiring, graceful shutdown)
 cmd/webhook-sim/      CLI that simulates a provider sending signed webhooks
 cmd/loadgen/          traffic generator for demos and dashboards
 cmd/seed/             demo data seeding with integrity check
+cmd/fakeprovider/     simulated payout provider with failure injection
 internal/ledger/      domain: accounts, double-entry postings, idempotent transfers
+internal/payout/      payouts: reserve-then-call, provider client, reconciler
+internal/fakeprovider/ simulated provider (idempotent, async webhooks)
 internal/webhook/     signature verification, event store, async worker
 internal/httpapi/     routes, handlers, error mapping, middleware
 internal/database/    connection and embedded SQL migrations
@@ -544,10 +767,12 @@ docs/                 Postman collection
 - [x] Prometheus metrics and Grafana dashboard
 - [x] Kubernetes manifests (kind) with probes, rolling updates and service discovery
 - [x] Seed command and Kubernetes Job
+- [x] Payouts through an external provider with reconciliation (crash-safe, never paid twice)
 - [ ] Publish ledger events to a message broker (transactional outbox → SQS/Kafka)
 - [ ] OpenTelemetry tracing and centralized logs (Loki)
 - [ ] Horizontal Pod Autoscaler based on request rate
 - [ ] Expiration (TTL) for idempotency keys
+- [ ] Versioned migrations (e.g. golang-migrate) instead of idempotent scripts
 - [ ] OpenAPI specification
 - [ ] Refund event (`payment.refunded`) and reversal transactions
 - [ ] API client authentication

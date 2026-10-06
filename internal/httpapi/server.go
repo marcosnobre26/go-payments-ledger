@@ -15,15 +15,17 @@ import (
 
 	"github.com/marcosnobre26/go-payments-ledger/internal/ledger"
 	"github.com/marcosnobre26/go-payments-ledger/internal/metrics"
+	"github.com/marcosnobre26/go-payments-ledger/internal/payout"
 	"github.com/marcosnobre26/go-payments-ledger/internal/webhook"
 )
 
-const maxBodyBytes = 1 << 20 // 1 MiB
+const maxBodyBytes = 1 << 20
 
 type Server struct {
 	ledger         *ledger.Service
 	webhooks       *webhook.Store
 	webhookSecrets map[string][]byte
+	payouts        *payout.Service
 	metrics        *metrics.Metrics
 	ready          func(context.Context) error
 	log            *slog.Logger
@@ -34,9 +36,11 @@ type Deps struct {
 	Ledger         *ledger.Service
 	Webhooks       *webhook.Store
 	WebhookSecrets map[string][]byte
+	Payouts        *payout.Service
 	Metrics        *metrics.Metrics
 	Logger         *slog.Logger
-	Ready          func(context.Context) error
+
+	Ready func(context.Context) error
 }
 
 func New(d Deps) *Server {
@@ -44,7 +48,7 @@ func New(d Deps) *Server {
 		d.Ready = func(context.Context) error { return nil }
 	}
 	return &Server{
-		ledger: d.Ledger, webhooks: d.Webhooks, webhookSecrets: d.WebhookSecrets,
+		ledger: d.Ledger, webhooks: d.Webhooks, webhookSecrets: d.WebhookSecrets, payouts: d.Payouts,
 		metrics: d.Metrics, ready: d.Ready, log: d.Logger, now: time.Now,
 	}
 }
@@ -64,6 +68,8 @@ func (s *Server) Handler() http.Handler {
 	handle("GET /v1/accounts/{id}", s.getAccount)
 	handle("GET /v1/accounts/{id}/entries", s.listEntries)
 	handle("POST /v1/transfers", s.createTransfer)
+	handle("POST /v1/payouts", s.createPayout)
+	handle("GET /v1/payouts/{id}", s.getPayout)
 	handle("POST /v1/webhooks/{provider}", s.receiveWebhook)
 	mux.Handle("GET /metrics", s.metrics.Handler())
 
@@ -143,6 +149,48 @@ func (s *Server) createTransfer(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, transfer)
 }
 
+func (s *Server) createPayout(w http.ResponseWriter, r *http.Request) {
+	if s.payouts == nil {
+		writeProblem(w, http.StatusServiceUnavailable, "payouts_disabled", "no payout provider is configured")
+		return
+	}
+	key := r.Header.Get("Idempotency-Key")
+	if key == "" || len(key) > 255 {
+		writeProblem(w, http.StatusBadRequest, "missing_idempotency_key",
+			"the Idempotency-Key header is required (max 255 characters)")
+		return
+	}
+	var in payout.CreateInput
+	if !decode(w, r, &in) {
+		return
+	}
+	p, replayed, err := s.payouts.Create(r.Context(), key, in)
+	if err != nil {
+		s.writeError(w, r, err)
+		return
+	}
+	if replayed {
+		w.Header().Set("Idempotent-Replayed", "true")
+		writeJSON(w, http.StatusOK, p)
+		return
+	}
+
+	writeJSON(w, http.StatusAccepted, p)
+}
+
+func (s *Server) getPayout(w http.ResponseWriter, r *http.Request) {
+	if s.payouts == nil {
+		writeProblem(w, http.StatusServiceUnavailable, "payouts_disabled", "no payout provider is configured")
+		return
+	}
+	p, err := s.payouts.Get(r.Context(), r.PathValue("id"))
+	if err != nil {
+		s.writeError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, p)
+}
+
 func (s *Server) receiveWebhook(w http.ResponseWriter, r *http.Request) {
 	provider := r.PathValue("provider")
 	secret, ok := s.webhookSecrets[provider]
@@ -176,6 +224,7 @@ func (s *Server) receiveWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.metrics.WebhooksReceived.Inc(provider, strconv.FormatBool(duplicate))
+
 	writeJSON(w, http.StatusAccepted, map[string]any{"received": true, "duplicate": duplicate})
 }
 
@@ -202,9 +251,12 @@ func errorCode(err error) string {
 		return "currency_mismatch"
 	case errors.Is(err, ledger.ErrIdempotencyKeyReused):
 		return "idempotency_key_reused"
+	case errors.Is(err, payout.ErrNotFound):
+		return "payout_not_found"
 	case errors.Is(err, ledger.ErrInvalidAmount),
 		errors.Is(err, ledger.ErrInvalidCurrency),
-		errors.Is(err, ledger.ErrSameAccount):
+		errors.Is(err, ledger.ErrSameAccount),
+		errors.Is(err, payout.ErrInvalidDestination):
 		return "validation_error"
 	default:
 		return "internal_error"
@@ -214,7 +266,7 @@ func errorCode(err error) string {
 func (s *Server) writeError(w http.ResponseWriter, r *http.Request, err error) {
 	code := errorCode(err)
 	switch code {
-	case "account_not_found":
+	case "account_not_found", "payout_not_found":
 		writeProblem(w, http.StatusNotFound, code, err.Error())
 	case "insufficient_funds", "currency_mismatch", "idempotency_key_reused":
 		writeProblem(w, http.StatusUnprocessableEntity, code, err.Error())

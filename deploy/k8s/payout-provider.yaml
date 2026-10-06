@@ -1,0 +1,75 @@
+# Simulated payment provider for payouts. One replica on purpose: it keeps its
+# state in memory, like a sandbox environment of a real provider.
+apiVersion: v1
+kind: Service
+metadata:
+  name: payout-provider
+spec:
+  selector:
+    app: payout-provider
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: payout-provider
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: payout-provider
+  template:
+    metadata:
+      labels:
+        app: payout-provider
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: payout-provider
+          image: go-payments-ledger:dev
+          imagePullPolicy: IfNotPresent
+          command: ["/fakeprovider"]
+          ports:
+            - name: http
+              containerPort: 8081
+          env:
+            - name: PORT
+              value: "8081"
+            - name: API_WEBHOOK_URL
+              value: http://api/v1/webhooks/acmepay
+            - name: WEBHOOK_DELAY
+              value: 3s
+            # Failure injection: payouts recorded but answered with 500, and
+            # outcome webhooks that never arrive. The API must recover both.
+            - name: FAIL_AFTER_RECORD_RATE
+              value: "0.1"
+            - name: DROP_WEBHOOK_RATE
+              value: "0.1"
+            - name: WEBHOOK_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: ledger-secrets
+                  key: WEBHOOK_SECRET
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+          resources:
+            requests:
+              cpu: 20m
+              memory: 32Mi
+            limits:
+              memory: 128Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]

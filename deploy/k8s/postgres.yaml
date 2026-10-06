@@ -3,14 +3,14 @@ kind: Service
 metadata:
   name: postgres
 spec:
-  clusterIP: None
+  clusterIP: None # headless: stable DNS name for the StatefulSet pod
   selector:
     app: postgres
   ports:
     - name: postgres
       port: 5432
 ---
-
+# StatefulSet + PersistentVolumeClaim: the data survives pod restarts.
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:

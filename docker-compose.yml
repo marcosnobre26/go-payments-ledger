@@ -19,8 +19,23 @@ services:
       DATABASE_URL: postgres://ledger:ledger@db:5432/ledger?sslmode=disable
       WEBHOOK_SECRET: dev-secret
       WEBHOOK_PROVIDER: acmepay
+      PAYOUT_PROVIDER_URL: http://provider:8081
+      PAYOUT_STALE_AFTER: 30s
     ports:
       - "8080:8080"
     depends_on:
       db:
         condition: service_healthy
+
+  # Simulated payment provider for payouts (see internal/fakeprovider).
+  provider:
+    build: .
+    entrypoint: ["/fakeprovider"]
+    environment:
+      API_WEBHOOK_URL: http://api:8080/v1/webhooks/acmepay
+      WEBHOOK_SECRET: dev-secret
+      WEBHOOK_DELAY: 3s
+      FAIL_AFTER_RECORD_RATE: "0.1"
+      DROP_WEBHOOK_RATE: "0.1"
+    ports:
+      - "8081:8081"

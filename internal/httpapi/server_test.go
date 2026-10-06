@@ -123,6 +123,7 @@ func TestMetricsAndReadinessEndpoints(t *testing.T) {
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
+
 	want := `http_requests_total{method="GET",route="/readyz",status="200"} 1`
 	if !bytes.Contains(body, []byte(want)) {
 		t.Fatalf("metrics output missing %q:\n%s", want, body)

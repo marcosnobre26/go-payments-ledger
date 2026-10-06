@@ -1,0 +1,703 @@
+{
+  "info": {
+    "_postman_id": "cec76440-ae1c-446f-90ff-e5889454c254",
+    "name": "go-payments-ledger",
+    "description": "Requests to try go-payments-ledger locally. Run '1. Setup' first.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "item": [
+    {
+      "name": "1. Setup",
+      "item": [
+        {
+          "name": "Health check",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/healthz",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "healthz"
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 200\", () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Create account A",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/accounts",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "accounts"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"currency\": \"BRL\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 201\", () => pm.response.to.have.status(201));",
+                  "pm.collectionVariables.set(\"account_a\", pm.response.json().id);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Create account B",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/accounts",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "accounts"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"currency\": \"BRL\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 201\", () => pm.response.to.have.status(201));",
+                  "pm.collectionVariables.set(\"account_b\", pm.response.json().id);"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "2. Webhooks",
+      "item": [
+        {
+          "name": "Webhook - payment.succeeded (send twice to test dedupe)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "X-Signature",
+                "value": "{{webhook_signature}}"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/webhooks/acmepay",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "webhooks",
+                "acmepay"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{{webhook_body}}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// Monta o corpo do webhook e assina com HMAC-SHA256, igual a um provedor real.",
+                  "// A assinatura é calculada sobre \"<timestamp>.<corpo>\", exatamente como o servidor verifica.",
+                  "const secret = pm.collectionVariables.get(\"webhook_secret\");",
+                  "const body = JSON.stringify({",
+                  "  id: pm.collectionVariables.get(\"event_id\"),",
+                  "  type: \"payment.succeeded\",",
+                  "  data: {",
+                  "    account_id: pm.collectionVariables.get(\"account_a\"),",
+                  "    amount: Number(pm.collectionVariables.get(\"deposit_amount\")),",
+                  "    currency: \"BRL\"",
+                  "  }",
+                  "});",
+                  "const ts = Math.floor(Date.now() / 1000);",
+                  "const sig = CryptoJS.HmacSHA256(ts + \".\" + body, secret).toString(CryptoJS.enc.Hex);",
+                  "pm.collectionVariables.set(\"webhook_body\", body);",
+                  "pm.collectionVariables.set(\"webhook_signature\", `t=${ts},v1=${sig}`);"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 202\", () => pm.response.to.have.status(202));",
+                  "const d = pm.response.json().duplicate;",
+                  "console.log(d ? \"Evento duplicado: ignorado\" : \"Evento novo: será processado pelo worker\");"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Webhook - forged signature (expect 401)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "X-Signature",
+                "value": "{{forged_signature}}"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/webhooks/acmepay",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "webhooks",
+                "acmepay"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{{forged_body}}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// Assina com um segredo ERRADO para simular um atacante.",
+                  "const body = JSON.stringify({ id: \"evt_forged\", type: \"payment.succeeded\",",
+                  "  data: { account_id: pm.collectionVariables.get(\"account_a\"), amount: 999999, currency: \"BRL\" } });",
+                  "const ts = Math.floor(Date.now() / 1000);",
+                  "const sig = CryptoJS.HmacSHA256(ts + \".\" + body, \"attacker-secret\").toString(CryptoJS.enc.Hex);",
+                  "pm.collectionVariables.set(\"forged_body\", body);",
+                  "pm.collectionVariables.set(\"forged_signature\", `t=${ts},v1=${sig}`);"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"forged webhook rejected with 401\", () => pm.response.to.have.status(401));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Get account A (balance)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/v1/accounts/{{account_a}}",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "accounts",
+                "{{account_a}}"
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 200\", () => pm.response.to.have.status(200));",
+                  "console.log(\"Saldo A:\", pm.response.json().balance);"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "3. Transfers",
+      "item": [
+        {
+          "name": "Transfer A -> B (send twice: 201 then 200 replay)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Idempotency-Key",
+                "value": "{{idempotency_key}}"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/transfers",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "transfers"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"from_account_id\": \"{{account_a}}\",\n  \"to_account_id\": \"{{account_b}}\",\n  \"amount\": 2500,\n  \"currency\": \"BRL\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"201 created or 200 replayed\", () => pm.expect(pm.response.code).to.be.oneOf([200, 201]));",
+                  "if (pm.response.code === 200) {",
+                  "  pm.test(\"replay header present\", () => pm.expect(pm.response.headers.get(\"Idempotent-Replayed\")).to.eql(\"true\"));",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Transfer - same key, different amount (expect 422)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Idempotency-Key",
+                "value": "{{idempotency_key}}"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/transfers",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "transfers"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"from_account_id\": \"{{account_a}}\",\n  \"to_account_id\": \"{{account_b}}\",\n  \"amount\": 9999,\n  \"currency\": \"BRL\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"idempotency key reuse rejected\", () => pm.response.to.have.status(422));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Transfer - insufficient funds (expect 422)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Idempotency-Key",
+                "value": "{{$guid}}"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/transfers",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "transfers"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"from_account_id\": \"{{account_a}}\",\n  \"to_account_id\": \"{{account_b}}\",\n  \"amount\": 99999999,\n  \"currency\": \"BRL\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"insufficient funds\", () => pm.response.to.have.status(422));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Transfer - missing Idempotency-Key (expect 400)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/transfers",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "transfers"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"from_account_id\": \"{{account_a}}\",\n  \"to_account_id\": \"{{account_b}}\",\n  \"amount\": 100,\n  \"currency\": \"BRL\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"missing key rejected\", () => pm.response.to.have.status(400));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Account A statement",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/v1/accounts/{{account_a}}/entries",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "accounts",
+                "{{account_a}}",
+                "entries"
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 200\", () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "4. Payouts",
+      "item": [
+        {
+          "name": "Create payout (send twice: 202 then 200 replay)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Idempotency-Key",
+                "value": "{{payout_key}}"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/payouts",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "payouts"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"account_id\": \"{{account_a}}\",\n  \"amount\": 1500,\n  \"currency\": \"BRL\",\n  \"destination\": \"{{payout_destination}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"202 accepted or 200 replayed\", () => pm.expect(pm.response.code).to.be.oneOf([200, 202]));",
+                  "pm.collectionVariables.set(\"payout_id\", pm.response.json().id);",
+                  "console.log(\"Payout status:\", pm.response.json().status);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Get payout (watch status change)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/v1/payouts/{{payout_id}}",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "payouts",
+                "{{payout_id}}"
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 200\", () => pm.response.to.have.status(200));",
+                  "console.log(\"Payout status:\", pm.response.json().status);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Payout rejected by provider (expect status failed)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Idempotency-Key",
+                "value": "{{$guid}}"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/payouts",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "payouts"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"account_id\": \"{{account_a}}\",\n  \"amount\": 500,\n  \"currency\": \"BRL\",\n  \"destination\": \"invalid-destination\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"funds released: status failed\", () => pm.expect(pm.response.json().status).to.eql(\"failed\"));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "variable": [
+    {
+      "key": "base_url",
+      "value": "http://localhost:8080"
+    },
+    {
+      "key": "webhook_secret",
+      "value": "dev-secret"
+    },
+    {
+      "key": "event_id",
+      "value": "evt_postman_1"
+    },
+    {
+      "key": "deposit_amount",
+      "value": "10000"
+    },
+    {
+      "key": "idempotency_key",
+      "value": "pedido-1"
+    },
+    {
+      "key": "account_a",
+      "value": ""
+    },
+    {
+      "key": "account_b",
+      "value": ""
+    },
+    {
+      "key": "webhook_body",
+      "value": ""
+    },
+    {
+      "key": "webhook_signature",
+      "value": ""
+    },
+    {
+      "key": "forged_body",
+      "value": ""
+    },
+    {
+      "key": "forged_signature",
+      "value": ""
+    },
+    {
+      "key": "payout_key",
+      "value": "payout-1"
+    },
+    {
+      "key": "payout_destination",
+      "value": "pix:marcos@example.com"
+    },
+    {
+      "key": "payout_id",
+      "value": ""
+    }
+  ]
+}

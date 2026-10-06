@@ -17,13 +17,31 @@ type Event struct {
 	ID   string `json:"id"`
 	Type string `json:"type"`
 	Data struct {
-		AccountID string `json:"account_id"`
-		Amount    int64  `json:"amount"`
-		Currency  string `json:"currency"`
+		AccountID string `json:"account_id,omitempty"`
+		Amount    int64  `json:"amount,omitempty"`
+		Currency  string `json:"currency,omitempty"`
+
+		PayoutID         string `json:"payout_id,omitempty"`
+		ProviderPayoutID string `json:"provider_payout_id,omitempty"`
+		FailureReason    string `json:"failure_reason,omitempty"`
 	} `json:"data"`
 }
 
-const EventPaymentSucceeded = "payment.succeeded"
+const (
+	EventPaymentSucceeded = "payment.succeeded"
+	EventPayoutPaid       = "payout.paid"
+	EventPayoutFailed     = "payout.failed"
+)
+
+type PayoutHandler interface {
+	MarkPaidTx(ctx context.Context, tx *sql.Tx, payoutID, providerRef string) error
+	MarkFailedTx(ctx context.Context, tx *sql.Tx, payoutID, providerRef, reason string) error
+}
+
+func isPermanent(err error) bool {
+	var p interface{ Permanent() bool }
+	return errors.As(err, &p) && p.Permanent()
+}
 
 var errMalformedPayload = errors.New("malformed event payload")
 
@@ -51,6 +69,7 @@ func (s *Store) Save(ctx context.Context, provider string, ev Event, raw []byte)
 type Worker struct {
 	db          *sql.DB
 	ledger      *ledger.Service
+	payouts     PayoutHandler
 	metrics     *metrics.Metrics
 	log         *slog.Logger
 	interval    time.Duration
@@ -59,6 +78,11 @@ type Worker struct {
 
 func NewWorker(db *sql.DB, l *ledger.Service, m *metrics.Metrics, log *slog.Logger) *Worker {
 	return &Worker{db: db, ledger: l, metrics: m, log: log, interval: time.Second, maxAttempts: 8}
+}
+
+func (w *Worker) WithPayouts(h PayoutHandler) *Worker {
+	w.payouts = h
+	return w
 }
 
 func (w *Worker) Run(ctx context.Context) {
@@ -89,7 +113,7 @@ func (w *Worker) ProcessNext(ctx context.Context) (processed bool, err error) {
 	if err != nil {
 		return false, err
 	}
-	defer tx.Rollback()
+	defer tx.Rollback() //nolint:errcheck
 
 	var (
 		id       int64
@@ -129,7 +153,7 @@ func (w *Worker) ProcessNext(ctx context.Context) (processed bool, err error) {
 			WHERE id = $1`, id)
 		log.Info("webhook processed")
 
-	case ledger.IsPermanent(applyErr) || errors.Is(applyErr, errMalformedPayload) || attempts+1 >= w.maxAttempts:
+	case ledger.IsPermanent(applyErr) || isPermanent(applyErr) || errors.Is(applyErr, errMalformedPayload) || attempts+1 >= w.maxAttempts:
 		result = "failed"
 		if _, err := tx.ExecContext(ctx, `ROLLBACK TO SAVEPOINT apply_event`); err != nil {
 			return false, err
@@ -182,7 +206,16 @@ func (w *Worker) apply(ctx context.Context, tx *sql.Tx, provider, eventID string
 	case EventPaymentSucceeded:
 		reference := provider + ":" + eventID
 		return w.ledger.DepositTx(ctx, tx, ev.Data.AccountID, ev.Data.Amount, ev.Data.Currency, reference)
+	case EventPayoutPaid, EventPayoutFailed:
+		if w.payouts == nil {
+			return fmt.Errorf("%w: payouts are not enabled", errMalformedPayload)
+		}
+		if ev.Type == EventPayoutPaid {
+			return w.payouts.MarkPaidTx(ctx, tx, ev.Data.PayoutID, ev.Data.ProviderPayoutID)
+		}
+		return w.payouts.MarkFailedTx(ctx, tx, ev.Data.PayoutID, ev.Data.ProviderPayoutID, ev.Data.FailureReason)
 	default:
+
 		return nil
 	}
 }

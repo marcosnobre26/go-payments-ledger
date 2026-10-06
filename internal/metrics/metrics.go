@@ -22,6 +22,8 @@ type Metrics struct {
 	WebhooksRejected  *CounterVec
 	WebhooksProcessed *CounterVec
 	WebhooksPending   *Gauge
+	Payouts           *CounterVec
+	PayoutsInFlight   *Gauge
 }
 
 func New() *Metrics {
@@ -43,6 +45,10 @@ func New() *Metrics {
 			"Webhook processing attempts by result (processed, retry, failed).", "result"),
 		WebhooksPending: r.NewGauge("webhook_events_pending",
 			"Webhook events waiting to be processed (backlog)."),
+		Payouts: r.NewCounterVec("ledger_payouts_total",
+			"Payout lifecycle events (reserved, submitted, submit_error, resubmitted, rejected, paid, failed, replayed).", "event"),
+		PayoutsInFlight: r.NewGauge("payouts_in_flight",
+			"Payouts not yet final (pending or submitted)."),
 	}
 	r.NewGaugeFunc("go_goroutines", "Number of goroutines.", func() float64 {
 		return float64(runtime.NumGoroutine())

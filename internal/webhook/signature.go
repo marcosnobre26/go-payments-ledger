@@ -65,6 +65,7 @@ func Verify(secret []byte, header string, body []byte, now time.Time, tolerance 
 	}
 
 	expected := Sign(secret, timestamp, body)
+
 	if !hmac.Equal([]byte(expected), []byte(signature)) {
 		return ErrInvalidSignature
 	}
